@@ -10,6 +10,9 @@ import psutil
 import gc
 from collections import Counter
 from datetime import datetime
+import subprocess
+from contextlib import contextmanager
+from typing import Optional, Dict, Any
 
 import cv2
 import numpy as np
@@ -250,6 +253,7 @@ def setup_scenario(wad_choice, logger):
 class DQN(nn.Module):
     def __init__(self, input_shape, num_actions):
         super(DQN, self).__init__()
+        self.use_checkpointing = True
         self.conv1 = nn.Conv2d(input_shape[0], 32, kernel_size=8, stride=4)
         self.conv2 = nn.Conv2d(32, 64, kernel_size=4, stride=2)
         self.conv3 = nn.Conv2d(64, 64, kernel_size=3, stride=1)
@@ -257,10 +261,21 @@ class DQN(nn.Module):
         self.fc2 = nn.Linear(512, num_actions)
 
     def forward(self, x):
+        if self.use_checkpointing:
+            x = torch.utils.checkpoint.checkpoint(self.conv_forward, x, use_reentrant=False)
+        else:
+            x = self.conv_forward(x)
+            
+        x = self.fc_forward(x)
+        return x
+
+    def conv_forward(self, x):
         x = F.relu(self.conv1(x))
         x = F.relu(self.conv2(x))
         x = F.relu(self.conv3(x))
-        x = x.view(x.size(0), -1)
+        return x.view(x.size(0), -1)
+
+    def fc_forward(self, x):
         x = F.relu(self.fc1(x))
         x = self.fc2(x)
         return x
@@ -658,118 +673,124 @@ def get_game_state_info(game):
         return 0, 0
 
 def run_episode(agent, game, actions, episode, frame_skip, lmp_dir, record_video, video_writer, stack_size, state_shape, logger, episode_metrics_df):
-    if RECORD_LMP:
-        lmp_file_path = os.path.join(lmp_dir, f"episode_{episode + 1}.lmp")
-        game.new_episode(lmp_file_path)
-    else:
-        game.new_episode()
-
-    game_state = game.get_state()
-    if game_state is None or game_state.screen_buffer is None:
-        logger.error(f"Skipping episode {episode+1} due to invalid game state.")
-        return None, 0, 0, 0, 0, 0, None
-
-    state_buffer = [game_state.screen_buffer] * stack_size
-    state = create_stacked_state(state_buffer)
-    if state is None:
-        logger.error(f"Skipping episode {episode + 1} due to state initialization error.")
-        return None, 0, 0, 0, 0, 0, None
-
-    total_reward = 0
-    step_count = 0
-    episode_start_time = time.time()
-    damage_taken = 0
-    damage_inflicted = 0
-    action_counts = Counter()
-    inference_times = []
-    loss, avg_q_value, grad_norm = None, None, None
-
-    while not game.is_episode_finished():
-        inference_start_time = time.time()
-
-        action_index = agent.select_action(state)
-
-        inference_end_time = time.time()
-        inference_times.append(inference_end_time - inference_start_time)
-
-        action = actions[action_index]
-        action_counts[action_index] += 1
-
-        reward = game.make_action(action, frame_skip)
-        done = game.is_episode_finished()
-
-        if not done:
-            game_state = game.get_state()
-            if game_state and game_state.screen_buffer is not None:
-                next_frame = game_state.screen_buffer
-                state_buffer.pop(0)
-                state_buffer.append(next_frame)
-                next_state = create_stacked_state(state_buffer)
-
-                if next_state is None:
-                    logger.error(f"Error: next_state is None in episode {episode + 1} at step {step_count + 1}.")
-                    break
-                damage_taken_step, damage_inflicted_step = get_game_state_info(game)
-                damage_taken += damage_taken_step
-                damage_inflicted += damage_inflicted_step
-            else:
-                logger.error(f"Error: Invalid state in episode {episode+1}, step {step_count+1}.")
-                next_state = np.zeros(state_shape)
-                break
+    with resource_cleanup():
+        if RECORD_LMP:
+            lmp_file_path = os.path.join(lmp_dir, f"episode_{episode + 1}.lmp")
+            game.new_episode(lmp_file_path)
         else:
-            next_state = np.zeros(state_shape)
+            game.new_episode()
 
-        agent.n_step_buffer.push(state, action_index, reward, next_state, done)
+        game_state = game.get_state()
+        if game_state is None or game_state.screen_buffer is None:
+            logger.error(f"Skipping episode {episode+1} due to invalid game state.")
+            return None, 0, 0, 0, 0, 0, None
 
-        n_step_experience = agent.n_step_buffer.get()
-        if n_step_experience:
-            n_step_state, n_step_action, n_step_reward, n_step_next_state, n_step_done = n_step_experience
-            agent.memory.push(n_step_state, n_step_action, n_step_reward, n_step_next_state, n_step_done)
+        state_buffer = [game_state.screen_buffer] * stack_size
+        state = create_stacked_state(state_buffer)
+        if state is None:
+            logger.error(f"Skipping episode {episode + 1} due to state initialization error.")
+            return None, 0, 0, 0, 0, 0, None
 
-        loss_step, avg_q_value_step, grad_norm_step = agent.learn()
-        if loss_step is not None:
-            loss = loss_step
-            avg_q_value = avg_q_value_step
-            grad_norm = grad_norm_step
+        total_reward = 0
+        step_count = 0
+        episode_start_time = time.time()
+        damage_taken = 0
+        damage_inflicted = 0
+        action_counts = Counter()
+        inference_times = []
+        loss, avg_q_value, grad_norm = None, None, None
 
-        state = next_state
-        total_reward += reward
-        step_count += 1
+        while not game.is_episode_finished():
+            inference_start_time = time.time()
 
-        if record_video and not done:
-            most_recent_frame = state_buffer[-1]
-            try:
-                video_writer.append_data(most_recent_frame)
-            except Exception as e:
-                logger.error(f"Error appending frame to video: {e}")
-                break
+            action_index = agent.select_action(state)
 
-    episode_survival_time = time.time() - episode_start_time
-    total_actions = sum(action_counts.values())
-    if total_actions > 0:
-        action_diversity = sum(count / total_actions for count in action_counts.values()) / len(actions)
-    else:
-        action_diversity = 0
+            inference_end_time = time.time()
+            inference_times.append(inference_end_time - inference_start_time)
 
-    avg_inference_time = np.mean(inference_times) if inference_times else 0
+            action = actions[action_index]
+            action_counts[action_index] += 1
 
-    if total_reward is not None:
-        new_row = {
-            'episode': episode + 1,
-            'reward': total_reward,
-            'steps': step_count,
-            'survival_time': episode_survival_time,
-            'damage_taken': damage_taken,
-            'damage_inflicted': damage_inflicted,
-            'action_diversity': action_diversity,
-            'avg_inference_time': avg_inference_time,
-            'loss': loss if loss is not None else np.nan,
-            'avg_q_value': avg_q_value if avg_q_value is not None else np.nan,
-            'grad_norm': grad_norm if grad_norm is not None else np.nan
-        }
-        return total_reward, step_count, episode_survival_time, damage_taken, damage_inflicted, action_diversity, avg_inference_time, new_row
-    else:
-        return None, 0, 0, 0, 0, 0, 0, None
+            reward = game.make_action(action, frame_skip)
+            done = game.is_episode_finished()
+
+            if not done:
+                game_state = game.get_state()
+                if game_state and game_state.screen_buffer is not None:
+                    next_frame = game_state.screen_buffer
+                    state_buffer.pop(0)
+                    state_buffer.append(next_frame)
+                    next_state = create_stacked_state(state_buffer)
+
+                    if next_state is None:
+                        logger.error(f"Error: next_state is None in episode {episode + 1} at step {step_count + 1}.")
+                        break
+                    damage_taken_step, damage_inflicted_step = get_game_state_info(game)
+                    damage_taken += damage_taken_step
+                    damage_inflicted += damage_inflicted_step
+                else:
+                    logger.error(f"Error: Invalid state in episode {episode+1}, step {step_count+1}.")
+                    next_state = np.zeros(state_shape)
+                    break
+            else:
+                next_state = np.zeros(state_shape)
+
+            agent.n_step_buffer.push(state, action_index, reward, next_state, done)
+
+            n_step_experience = agent.n_step_buffer.get()
+            if n_step_experience:
+                n_step_state, n_step_action, n_step_reward, n_step_next_state, n_step_done = n_step_experience
+                agent.memory.push(n_step_state, n_step_action, n_step_reward, n_step_next_state, n_step_done)
+
+            loss_step, avg_q_value_step, grad_norm_step = agent.learn()
+            if loss_step is not None:
+                loss = loss_step
+                avg_q_value = avg_q_value_step
+                grad_norm = grad_norm_step
+
+            state = next_state
+            total_reward += reward
+            step_count += 1
+
+            if record_video and not done:
+                most_recent_frame = state_buffer[-1]
+                try:
+                    video_writer.append_data(most_recent_frame)
+                except Exception as e:
+                    logger.error(f"Error appending frame to video: {e}")
+                    break
+
+        episode_survival_time = time.time() - episode_start_time
+        total_actions = sum(action_counts.values())
+        if total_actions > 0:
+            action_diversity = sum(count / total_actions for count in action_counts.values()) / len(actions)
+        else:
+            action_diversity = 0
+
+        avg_inference_time = np.mean(inference_times) if inference_times else 0
+
+        if total_reward is not None:
+            new_row = {
+                'episode': episode + 1,
+                'reward': total_reward,
+                'steps': step_count,
+                'survival_time': episode_survival_time,
+                'damage_taken': damage_taken,
+                'damage_inflicted': damage_inflicted,
+                'action_diversity': action_diversity,
+                'avg_inference_time': avg_inference_time,
+                'loss': loss if loss is not None else np.nan,
+                'avg_q_value': avg_q_value if avg_q_value is not None else np.nan,
+                'grad_norm': grad_norm if grad_norm is not None else np.nan
+            }
+            return total_reward, step_count, episode_survival_time, damage_taken, damage_inflicted, action_diversity, avg_inference_time, new_row
+        else:
+            return None, 0, 0, 0, 0, 0, 0, None
+
+    # After each episode
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    gc.collect()
 
 # --- Validation ---
 def validate_model(agent, game, actions, state_shape, stack_size, num_episodes, logger):
@@ -907,6 +928,107 @@ def get_hyperparameters():
             params[param_name]["value"] = param_info["default"]
 
     return params
+
+class ResourceMonitor:
+    def __init__(self, logger, use_gpu: bool = False):
+        self.logger = logger
+        self.use_gpu = use_gpu and torch.cuda.is_available()
+        self.process = psutil.Process()
+        if self.use_gpu:
+            self.log_gpu_info()
+    
+    def log_gpu_info(self):
+        """Log GPU device information at startup"""
+        if self.use_gpu:
+            device = torch.cuda.get_device_properties(0)
+            self.logger.info(f"GPU Device: {device.name}")
+            self.logger.info(f"Total GPU Memory: {device.total_memory / 1024**2:.2f} MB")
+            try:
+                nvidia_smi = subprocess.check_output(["nvidia-smi"], encoding='utf-8')
+                self.logger.info(f"NVIDIA-SMI Output:\n{nvidia_smi}")
+            except:
+                self.logger.warning("Could not get nvidia-smi output")
+
+    def get_system_metrics(self) -> Dict[str, Any]:
+        """Collect system resource metrics"""
+        metrics = {
+            'process_ram_mb': self.process.memory_info().rss / 1024**2,
+            'system_ram_percent': psutil.virtual_memory().percent,
+            'available_ram_mb': psutil.virtual_memory().available / 1024**2,
+            'cpu_percent': psutil.cpu_percent(),
+            'per_cpu_percent': psutil.cpu_percent(percpu=True)
+        }
+        
+        if self.use_gpu:
+            metrics.update({
+                'gpu_allocated_mb': torch.cuda.memory_allocated() / 1024**2,
+                'gpu_reserved_mb': torch.cuda.memory_reserved() / 1024**2,
+                'gpu_max_allocated_mb': torch.cuda.max_memory_allocated() / 1024**2
+            })
+            try:
+                nvidia_out = subprocess.check_output(
+                    ['nvidia-smi', '--query-gpu=utilization.gpu,temperature.gpu', 
+                     '--format=csv,noheader,nounits'],
+                    encoding='utf-8'
+                )
+                gpu_util, gpu_temp = map(int, nvidia_out.strip().split(','))
+                metrics.update({
+                    'gpu_utilization': gpu_util,
+                    'gpu_temperature': gpu_temp
+                })
+            except:
+                self.logger.warning("Could not get NVIDIA-SMI metrics")
+        
+        return metrics
+
+    def log_metrics(self, tensorboard_writer, episode):
+        """Log metrics to both logger and tensorboard"""
+        metrics = self.get_system_metrics()
+        
+        # Log to tensorboard
+        for name, value in metrics.items():
+            if not isinstance(value, (list, tuple)):
+                tensorboard_writer.add_scalar(f"Resources/{name}", value, episode)
+        
+        # Format metrics for logger
+        metrics_str = ", ".join([
+            f"{k}: {v:.2f}" if isinstance(v, float) 
+            else f"{k}: {v}" for k, v in metrics.items()
+            if not isinstance(v, (list, tuple))
+        ])
+        self.logger.info(f"Resource Usage - {metrics_str}")
+        
+        return metrics
+
+@contextmanager
+def resource_cleanup(game=None, video_writer=None, tensorboard_writer=None, agent=None):
+    """Context manager for proper resource cleanup"""
+    try:
+        yield
+    finally:
+        try:
+            if video_writer:
+                video_writer.close()
+            if tensorboard_writer:
+                tensorboard_writer.close()
+            if game:
+                game.close()
+            if agent:
+                # Explicitly delete large objects
+                del agent.policy_net
+                del agent.target_net
+                del agent.memory
+                del agent
+            
+            # Clear CUDA cache
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            
+            # Force garbage collection
+            gc.collect()
+            
+        except Exception as e:
+            print(f"Error during cleanup: {e}")
 
 def main():
     global LEARNING_RATE, BATCH_SIZE, MEMORY_CAPACITY, GAMMA, TAU
@@ -1059,107 +1181,127 @@ def main():
     action_diversity_list = []
     training_start_time = time.time()
     best_avg_reward = float('-inf')
-    # --- Training Loop ---
+    # Initialize resource monitor
+    resource_monitor = ResourceMonitor(logger, use_gpu=torch.cuda.is_available())
+    
     try:
-        for episode in range(NUM_EPISODES):
-            (
-                total_reward,
-                step_count,
-                episode_survival_time,
-                damage_taken,
-                damage_inflicted,
-                action_diversity,
-                avg_inference_time,
-                new_row,
-            ) = run_episode(
-                agent,
-                game,
-                actions,
-                episode,
-                FRAME_SKIP,
-                LMP_DIR,
-                RECORD_VIDEO,
-                video_writer,
-                STACK_SIZE,
-                state_shape,
-                logger,
-                episode_metrics_df,
-            )
-            if total_reward is not None:
-                episode_metrics_df = pd.concat([episode_metrics_df, pd.DataFrame([new_row])], ignore_index=True)
-                episode_survival_times.append(episode_survival_time)
-                episode_rewards.append(total_reward)
-                episode_lengths.append(step_count)
-                episode_damage_taken.append(damage_taken)
-                episode_damage_inflicted.append(damage_inflicted)
-                agent.update_epsilon()
-
-                if episode % MODEL_SAVE_FREQ == 0:
-                    dt_string = datetime.now().strftime("%Y%m%d%H%M")
-                    model_filename = f"{dt_string}_dqn_model_episode_{episode + 1}.pth"
-                    model_path = os.path.join(DRIVE_MODEL_DIR, model_filename)
-                    agent.save_model(model_path)
-                    logger.info(f"Model saved to {model_path} at episode {episode+1}")
-                # --- Update Target Network ---
-                agent.update_target_network()
-                # --- Validation Step ---
-                if USE_BEST_MODEL_CALLBACK:
-                        validation_reward = validate_model(agent, game, actions, state_shape, STACK_SIZE, VALIDATION_EPISODES, logger)
-                        logger.info(f"Validation Reward (Episode {episode+1}): {validation_reward}")
-                        best_model_callback(agent, episode_rewards, logger, DRIVE_MODEL_DIR, BEST_MODEL_SMOOTHING_WINDOW)
-                # --- Log Metrics ---
-                # --- Get memory usage ---
-                process = psutil.Process(os.getpid())
-                ram_usage = process.memory_info().rss / 1024**2
-                gpu_memory_usage = torch.cuda.max_memory_allocated() / 1024**2 if torch.cuda.is_available() else 0
-
-                ram_usage_list.append(ram_usage)
-                gpu_memory_usage_list.append(gpu_memory_usage)
-                action_diversity_list.append(action_diversity)
-                avg_reward = np.mean(episode_rewards[-100:])
-                avg_survival_time = np.mean(episode_survival_times[-100:])
-                avg_loss = np.mean(episode_metrics_df['loss'])
-                avg_q_value = np.mean(episode_metrics_df['avg_q_value'])
-                avg_grad_norm = np.mean(episode_metrics_df['grad_norm'])
-                training_time = time.time() - training_start_time
-                # --- Save metrics ---
-                save_metrics(episode_rewards, episode_lengths, episode_survival_times,
-                            episode_damage_taken, episode_damage_inflicted, logger, episode_metrics_df, training_time,
-                            ram_usage_list, gpu_memory_usage_list, action_diversity_list)
-
-                logger.info(
-                    f"Episode {episode+1}/{NUM_EPISODES}, Total Reward: {total_reward}, Steps: {step_count}, "
-                    f"Epsilon: {agent.epsilon:.3f}, Avg Reward (last 100): {avg_reward:.2f}, "
-                    f"Survival Time: {episode_survival_time:.2f}s, Avg Survival Time (last 100): {avg_survival_time:.2f}s, "
-                    f"Damage Taken: {damage_taken}, Damage Inflicted: {damage_inflicted}, Avg Inference Time: {avg_inference_time:.4f}s, "
-                    f"RAM Usage: {ram_usage:.2f}MB, GPU Mem Usage: {gpu_memory_usage:.2f}MB, Action Diversity: {action_diversity:.2f}"
-                    f"Training Time: {training_time:.2f}s, Avg Loss: {avg_loss:.4f}, Avg Q-Value: {avg_q_value:.4f}, Avg Grad Norm: {avg_grad_norm:.4f}"
+        # Use context manager for resource cleanup
+        with resource_cleanup(game, video_writer, tensorboard_writer, agent):
+            for episode in range(NUM_EPISODES):
+                (
+                    total_reward,
+                    step_count,
+                    episode_survival_time,
+                    damage_taken,
+                    damage_inflicted,
+                    action_diversity,
+                    avg_inference_time,
+                    new_row,
+                ) = run_episode(
+                    agent,
+                    game,
+                    actions,
+                    episode,
+                    FRAME_SKIP,
+                    LMP_DIR,
+                    RECORD_VIDEO,
+                    video_writer,
+                    STACK_SIZE,
+                    state_shape,
+                    logger,
+                    episode_metrics_df,
                 )
+                if total_reward is not None:
+                    episode_metrics_df = pd.concat([episode_metrics_df, pd.DataFrame([new_row])], ignore_index=True)
+                    episode_survival_times.append(episode_survival_time)
+                    episode_rewards.append(total_reward)
+                    episode_lengths.append(step_count)
+                    episode_damage_taken.append(damage_taken)
+                    episode_damage_inflicted.append(damage_inflicted)
+                    agent.update_epsilon()
 
-                tensorboard_writer.add_scalar("Reward/Total", total_reward, episode)
-                tensorboard_writer.add_scalar("Reward/Average", avg_reward, episode)
-                tensorboard_writer.add_scalar("Epsilon", agent.epsilon, episode)
-                tensorboard_writer.add_scalar("Survival Time/Average", avg_survival_time, episode)
-                tensorboard_writer.add_scalar("Action Diversity", action_diversity, episode)
-                tensorboard_writer.add_scalar("Damage Taken", damage_taken, episode)
-                tensorboard_writer.add_scalar("Damage Inflicted", damage_inflicted, episode)
-                tensorboard_writer.add_scalar("RAM Usage", ram_usage, episode)
-                tensorboard_writer.add_scalar("GPU Usage", gpu_memory_usage, episode)
-                tensorboard_writer.add_scalar("Avg Inference Time", avg_inference_time, episode)
-                tensorboard_writer.add_scalar("Loss/Average", avg_loss, episode)
-                tensorboard_writer.add_scalar("Q-Value/Average", avg_q_value, episode)
-                tensorboard_writer.add_scalar("Gradient Norm/Average", avg_grad_norm, episode)
+                    if episode % MODEL_SAVE_FREQ == 0:
+                        dt_string = datetime.now().strftime("%Y%m%d%H%M")
+                        model_filename = f"{dt_string}_dqn_model_episode_{episode + 1}.pth"
+                        model_path = os.path.join(DRIVE_MODEL_DIR, model_filename)
+                        agent.save_model(model_path)
+                        logger.info(f"Model saved to {model_path} at episode {episode+1}")
+                    # --- Update Target Network ---
+                    agent.update_target_network()
+                    # --- Validation Step ---
+                    if USE_BEST_MODEL_CALLBACK:
+                            validation_reward = validate_model(agent, game, actions, state_shape, STACK_SIZE, VALIDATION_EPISODES, logger)
+                            logger.info(f"Validation Reward (Episode {episode+1}): {validation_reward}")
+                            best_model_callback(agent, episode_rewards, logger, DRIVE_MODEL_DIR, BEST_MODEL_SMOOTHING_WINDOW)
+                    # --- Log Metrics ---
+                    # --- Get memory usage ---
+                    process = psutil.Process(os.getpid())
+                    ram_usage = process.memory_info().rss / 1024**2
+                    gpu_memory_usage = torch.cuda.max_memory_allocated() / 1024**2 if torch.cuda.is_available() else 0
 
-                # --- Clear memory ---
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+                    ram_usage_list.append(ram_usage)
+                    gpu_memory_usage_list.append(gpu_memory_usage)
+                    action_diversity_list.append(action_diversity)
+                    avg_reward = np.mean(episode_rewards[-100:])
+                    avg_survival_time = np.mean(episode_survival_times[-100:])
+                    avg_loss = np.mean(episode_metrics_df['loss'])
+                    avg_q_value = np.mean(episode_metrics_df['avg_q_value'])
+                    avg_grad_norm = np.mean(episode_metrics_df['grad_norm'])
+                    training_time = time.time() - training_start_time
+                    # --- Save metrics ---
+                    save_metrics(episode_rewards, episode_lengths, episode_survival_times,
+                                episode_damage_taken, episode_damage_inflicted, logger, episode_metrics_df, training_time,
+                                ram_usage_list, gpu_memory_usage_list, action_diversity_list)
+
+                    logger.info(
+                        f"Episode {episode+1}/{NUM_EPISODES}, Total Reward: {total_reward}, Steps: {step_count}, "
+                        f"Epsilon: {agent.epsilon:.3f}, Avg Reward (last 100): {avg_reward:.2f}, "
+                        f"Survival Time: {episode_survival_time:.2f}s, Avg Survival Time (last 100): {avg_survival_time:.2f}s, "
+                        f"Damage Taken: {damage_taken}, Damage Inflicted: {damage_inflicted}, Avg Inference Time: {avg_inference_time:.4f}s, "
+                        f"RAM Usage: {ram_usage:.2f}MB, GPU Mem Usage: {gpu_memory_usage:.2f}MB, Action Diversity: {action_diversity:.2f}"
+                        f"Training Time: {training_time:.2f}s, Avg Loss: {avg_loss:.4f}, Avg Q-Value: {avg_q_value:.4f}, Avg Grad Norm: {avg_grad_norm:.4f}"
+                    )
+
+                    tensorboard_writer.add_scalar("Reward/Total", total_reward, episode)
+                    tensorboard_writer.add_scalar("Reward/Average", avg_reward, episode)
+                    tensorboard_writer.add_scalar("Epsilon", agent.epsilon, episode)
+                    tensorboard_writer.add_scalar("Survival Time/Average", avg_survival_time, episode)
+                    tensorboard_writer.add_scalar("Action Diversity", action_diversity, episode)
+                    tensorboard_writer.add_scalar("Damage Taken", damage_taken, episode)
+                    tensorboard_writer.add_scalar("Damage Inflicted", damage_inflicted, episode)
+                    tensorboard_writer.add_scalar("RAM Usage", ram_usage, episode)
+                    tensorboard_writer.add_scalar("GPU Usage", gpu_memory_usage, episode)
+                    tensorboard_writer.add_scalar("Avg Inference Time", avg_inference_time, episode)
+                    tensorboard_writer.add_scalar("Loss/Average", avg_loss, episode)
+                    tensorboard_writer.add_scalar("Q-Value/Average", avg_q_value, episode)
+                    tensorboard_writer.add_scalar("Gradient Norm/Average", avg_grad_norm, episode)
+
+                    # --- Clear memory ---
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                # Get and log resource metrics
+                metrics = resource_monitor.log_metrics(tensorboard_writer, episode)
+                
+                # Add resource metrics to episode_metrics_df
+                if new_row is not None:
+                    new_row.update({
+                        f'resource_{k}': v for k, v in metrics.items()
+                        if not isinstance(v, (list, tuple))
+                    })
+                    episode_metrics_df = pd.concat(
+                        [episode_metrics_df, pd.DataFrame([new_row])],
+                        ignore_index=True
+                    )
+                if episode % 5 == 0:  # Every 5 episodes
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    
     except Exception as e:
         logger.error(f"Error during training: {e}")
         raise e
-    
     finally:
-        # Proper cleanup
         try:
             close_writers(video_writer, tensorboard_writer)
             if game:
@@ -1168,7 +1310,6 @@ def main():
         except Exception as e:
             logger.error(f"Error during cleanup: {e}")
 
-# --- Run the main function ---
 if __name__ == "__main__":
     main()
 
