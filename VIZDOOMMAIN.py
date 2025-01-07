@@ -604,16 +604,19 @@ def setup_vizdoom(scenario_path, wad_path=None, logger=None):
 
 # --- Video Writer ---
 def setup_video_writer(video_path, video_fps, logger=None):
-    if RECORD_VIDEO:
-      try:
-        video_writer = imageio.get_writer(video_path, fps=video_fps)
-        logger.info(f"Video Writer set up at: {video_path}")
-        return video_writer
-      except Exception as e:
-          logger.error(f"Error during video writer setup: {e}")
-          return None
-    else:
-      return None
+    """Setup video writer with explicit path"""
+    if video_path:
+        try:
+            os.makedirs(os.path.dirname(video_path), exist_ok=True)
+            video_writer = imageio.get_writer(video_path, fps=video_fps)
+            if logger:
+                logger.info(f"Video Writer set up at: {video_path}")
+            return video_writer
+        except Exception as e:
+            if logger:
+                logger.error(f"Error during video writer setup: {e}")
+            return None
+    return None
 
 # --- TensorBoard Setup ---
 def setup_tensorboard(log_dir, logger=None):
@@ -784,19 +787,42 @@ def validate_model(agent, game, actions, state_shape, stack_size, num_episodes, 
             total_rewards.append(total_reward)
     return np.mean(total_rewards) if total_rewards else float('-inf')
 
+def get_timestamp_prefix():
+    """Get timestamp prefix in MMDDHHmm format"""
+    return datetime.now().strftime("%m%d%H%M")
+
+def save_model_with_timestamp(agent, model_dir, episode=None, is_best=False, logger=None):
+    """Save model with timestamp prefix"""
+    try:
+        timestamp = get_timestamp_prefix()
+        if is_best:
+            filename = f"{timestamp}_best_model.pth"
+        else:
+            filename = f"{timestamp}_model_episode_{episode}.pth"
+        
+        model_path = os.path.join(model_dir, filename)
+        agent.save_model(model_path)
+        if logger:
+            logger.info(f"Model saved: {filename}")
+        return model_path
+    except Exception as e:
+        if logger:
+            logger.error(f"Error saving model: {e}")
+        return None
+
 def best_model_callback(agent, episode_rewards, logger, model_dir, best_model_smoothing_window):
     """Callback to save the best model based on a smoothed average reward."""
     if len(episode_rewards) >= best_model_smoothing_window:
         avg_reward = np.mean(episode_rewards[-best_model_smoothing_window:])
     else:
         avg_reward = np.mean(episode_rewards) if episode_rewards else float('-inf')
+    
     if avg_reward > agent.best_avg_reward:
         agent.best_avg_reward = avg_reward
         agent.best_model_state = deepcopy(agent.policy_net.state_dict())
-        model_filename = f"best_dqn_model.pth"
-        model_path = os.path.join(model_dir, model_filename)
-        agent.save_model(model_path)
-        logger.info(f"Best model saved to {model_path} with reward: {agent.best_avg_reward}")
+        model_path = save_model_with_timestamp(agent, model_dir, is_best=True, logger=logger)
+        if model_path:
+            logger.info(f"Best model saved with reward: {agent.best_avg_reward}")
 
 # --- Save metrics to CSV ---
 def save_metrics(episode_rewards, episode_lengths, episode_survival_times,
@@ -931,8 +957,17 @@ def get_run_mode():
         except ValueError:
             print("Please enter a valid number")
 
+# Add new utility function for video path
+def get_recording_path():
+    """Get recording path with timestamp prefix"""
+    timestamp = datetime.now().strftime("%m%d%H%M")
+    filename = f"{timestamp}_game_recording.mp4"
+    os.makedirs(VIDEO_DIR, exist_ok=True)  # Ensure directory exists
+    return os.path.join(VIDEO_DIR, filename)
+
+# Update quick_run_setup function to handle recording
 def quick_run_setup(logger):
-    """Quick run setup with model selection"""
+    """Quick run setup with model selection and recording option"""
     try:
         # First handle model choice
         print("\nModel Selection:")
@@ -944,19 +979,58 @@ def quick_run_setup(logger):
                 break
             print("Please enter 1 or 2")
 
-        episodes = int(input("Enter number of episodes (default=1): ").strip() or "1")
-        save_freq = int(input("Enter model save frequency (default=1): ").strip() or "1")
+        # Add recording choice
+        print("\nRecording Option:")
+        print("1. Record gameplay")
+        print("2. No recording")
+        while True:
+            record_choice = input("Enter choice (1 or 2): ").strip()
+            if record_choice in ['1', '2']:
+                break
+            print("Please enter 1 or 2")
 
-        return {
-            "num_episodes": max(1, episodes),
-            "model_save_freq": max(1, save_freq),
-            "record_video": False,
-            "frame_skip": FRAME_SKIP_TRAINING,
-            "create_new_model": model_choice == '1',
-            **default_config  # Include other defaults
-        }
-    except ValueError as e:
-        logger.error(f"Invalid input: {e}")
+        # Get number of episodes with input validation
+        while True:
+            try:
+                episodes_input = input("Enter number of episodes (default=1): ").strip()
+                episodes = int(episodes_input) if episodes_input else 1
+                if episodes > 0:
+                    break
+                print("Please enter a positive number")
+            except ValueError:
+                print("Please enter a valid number")
+        
+        # Get save frequency with input validation
+        while True:
+            try:
+                save_freq_input = input("Enter model save frequency (default=1): ").strip()
+                save_freq = int(save_freq_input) if save_freq_input else 1
+                if save_freq > 0:
+                    break
+                print("Please enter a positive number")
+            except ValueError:
+                print("Please enter a valid number")
+
+        should_record = record_choice == '1'
+        video_path = get_recording_path() if should_record else None
+
+        config = default_config.copy()
+        config.update({
+            "num_episodes": episodes,
+            "model_save_freq": save_freq,
+            "record_video": should_record,
+            "video_path": video_path,
+            "frame_skip": FRAME_SKIP_RECORDING if should_record else FRAME_SKIP_TRAINING,
+            "create_new_model": model_choice == '1'
+        })
+        
+        logger.info(f"Quick run setup complete. Episodes: {episodes}, Save frequency: {save_freq}, Recording: {should_record}")
+        if should_record:
+            logger.info(f"Video will be saved to: {video_path}")
+        return config
+        
+    except Exception as e:
+        logger.error(f"Error in quick run setup: {e}")
         return default_config
 
 def get_run_config(logger):
@@ -1038,8 +1112,10 @@ def main():
             agent = scan_for_models(agent, config["drive_model_dir"], logger)
 
         # Setup writers
-        if config["record_video"]:
-            video_writer = setup_video_writer(VIDEO_PATH, VIDEO_FPS, logger)
+        video_writer = None
+        if config.get("record_video", False):
+            video_path = config.get("video_path") or get_recording_path()
+            video_writer = setup_video_writer(video_path, VIDEO_FPS, logger)
         tensorboard_writer = setup_tensorboard(log_dir, logger)
 
         # Initialize metrics tracking
@@ -1100,9 +1176,7 @@ def main():
 
                 # Save model if needed
                 if (episode + 1) % config["model_save_freq"] == 0:
-                    model_path = os.path.join(config["drive_model_dir"], f"model_episode_{episode+1}.pth")
-                    agent.save_model(model_path)
-                    logger.info(f"Model saved at episode {episode+1}")
+                    save_model_with_timestamp(agent, config["drive_model_dir"], episode=episode+1, logger=logger)
 
                 # Save best model if enabled
                 if USE_BEST_MODEL_CALLBACK:
