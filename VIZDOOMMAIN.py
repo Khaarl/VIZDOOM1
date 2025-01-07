@@ -8,6 +8,7 @@ import logging
 import glob
 import psutil
 import gc
+import math  # Add math import
 from collections import Counter
 from datetime import datetime
 
@@ -74,11 +75,11 @@ CONFIG = load_config()
 def setup_logger(log_dir, timestamp):
     log_file = os.path.join(log_dir, f"training_{timestamp}.log")
     logger = logging.getLogger(__name__)
-    
+
     # Clear any existing handlers
     if logger.hasHandlers():
         logger.handlers.clear()
-        
+
     logger.setLevel(logging.DEBUG)
 
     file_handler = logging.FileHandler(log_file)
@@ -277,15 +278,15 @@ class NoisyLinear(nn.Module):
         self.in_features = in_features
         self.out_features = out_features
         self.std_init = std_init
-        
+
         self.weight_mu = nn.Parameter(torch.empty(out_features, in_features))
         self.weight_sigma = nn.Parameter(torch.empty(out_features, in_features))
         self.register_buffer('weight_epsilon', torch.empty(out_features, in_features))
-        
+
         self.bias_mu = nn.Parameter(torch.empty(out_features))
         self.bias_sigma = nn.Parameter(torch.empty(out_features))
         self.register_buffer('bias_epsilon', torch.empty(out_features))
-        
+
         self.reset_parameters()
         self.reset_noise()
 
@@ -307,21 +308,21 @@ class NoisyLinear(nn.Module):
         return x.sign().mul_(x.abs().sqrt_())
 
     def forward(self, x):
-        return F.linear(x, 
+        return F.linear(x,
                        self.weight_mu + self.weight_sigma * self.weight_epsilon,
                        self.bias_mu + self.bias_sigma * self.bias_epsilon)
 
 class DuelingDQN(nn.Module):
     def __init__(self, input_shape, num_actions, use_noisy=True):
         super(DuelingDQN, self).__init__()
-        
+
         # Convolutional layers
         self.conv1 = nn.Conv2d(input_shape[0], 32, kernel_size=8, stride=4)
-        self.conv2 = nn.Conv2d(32, 64, kernel_size=4, stride=2) 
+        self.conv2 = nn.Conv2d(32, 64, kernel_size=4, stride=2)
         self.conv3 = nn.Conv2d(64, 64, kernel_size=3, stride=1)
-        
+
         conv_out_size = self._get_conv_output(input_shape)
-        
+
         # Value stream
         if use_noisy:
             self.value_fc = NoisyLinear(conv_out_size, 512)
@@ -329,45 +330,45 @@ class DuelingDQN(nn.Module):
         else:
             self.value_fc = nn.Linear(conv_out_size, 512)
             self.value = nn.Linear(512, 1)
-            
-        # Advantage stream  
+
+        # Advantage stream
         if use_noisy:
             self.advantage_fc = NoisyLinear(conv_out_size, 512)
             self.advantage = NoisyLinear(512, num_actions)
         else:
             self.advantage_fc = nn.Linear(conv_out_size, 512)
             self.advantage = nn.Linear(512, num_actions)
-            
+
         self.use_noisy = use_noisy
         self.apply(self._init_weights)
-        
+
     def _init_weights(self, m):
         if isinstance(m, (nn.Conv2d, nn.Linear)):
             nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
             if m.bias is not None:
                 nn.init.zeros_(m.bias)
-                
+
     def _get_conv_output(self, shape):
         o = torch.zeros(1, *shape)
         o = F.relu(self.conv1(o))
         o = F.relu(self.conv2(o))
         o = F.relu(self.conv3(o))
         return int(np.prod(o.size()))
-        
+
     def forward(self, x):
         x = F.relu(self.conv1(x))
         x = F.relu(self.conv2(x))
         x = F.relu(self.conv3(x))
         x = x.view(x.size(0), -1)
-        
+
         value = F.relu(self.value_fc(x))
         value = self.value(value)
-        
+
         advantage = F.relu(self.advantage_fc(x))
         advantage = self.advantage(advantage)
-        
+
         return value + advantage - advantage.mean(dim=1, keepdim=True)
-        
+
     def reset_noise(self):
         if self.use_noisy:
             for m in self.modules():
@@ -445,7 +446,7 @@ class NStepBuffer:
 
 # --- DQNAgent ---
 class DQNAgent:
-    def __init__(self, state_shape, num_actions, learning_rate, gamma, epsilon_start, epsilon_end, epsilon_decay, memory_capacity, batch_size, tau, n_step, grad_clip_norm, epsilon_decay_rate_step):
+    def __init__(self, state_shape, num_actions, learning_rate, gamma, epsilon_start, epsilon_end, epsilon_decay, memory_capacity, batch_size, tau, n_step, grad_clip_norm, epsilon_decay_rate_step, use_noisy=True):
         self.state_shape = state_shape
         self.num_actions = num_actions
         self.gamma = gamma
@@ -457,8 +458,8 @@ class DQNAgent:
         self.tau = tau
         self.grad_clip_norm = grad_clip_norm
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.policy_net = DQN(state_shape, num_actions).to(self.device)
-        self.target_net = DQN(state_shape, num_actions).to(self.device)
+        self.policy_net = DuelingDQN(state_shape, num_actions, use_noisy=use_noisy).to(self.device)
+        self.target_net = DuelingDQN(state_shape, num_actions, use_noisy=use_noisy).to(self.device)
         self.target_net.load_state_dict(self.policy_net.state_dict())
         self.target_net.eval()
 
@@ -657,7 +658,26 @@ def get_game_state_info(game):
     else:
         return 0, 0
 
+def process_game_step(game, action, frame_skip):
+    """Processes a single step in the game environment."""
+    reward = game.make_action(action, frame_skip)
+    done = game.is_episode_finished()
+    return reward, done
+
+def update_agent(agent, state, action_index, reward, next_state, done, logger):
+    """Updates the agent's knowledge based on the experience."""
+    agent.n_step_buffer.push(state, action_index, reward, next_state, done)
+    n_step_experience = agent.n_step_buffer.get()
+
+    if n_step_experience:
+        n_step_state, n_step_action, n_step_reward, n_step_next_state, n_step_done = n_step_experience
+        agent.memory.push(n_step_state, n_step_action, n_step_reward, n_step_next_state, n_step_done)
+
+    loss, avg_q_value, grad_norm = agent.learn()
+    return loss, avg_q_value, grad_norm
+
 def run_episode(agent, game, actions, episode, frame_skip, lmp_dir, record_video, video_writer, stack_size, state_shape, logger, episode_metrics_df):
+    """Runs a single episode of the game."""
     if RECORD_LMP:
         lmp_file_path = os.path.join(lmp_dir, f"episode_{episode + 1}.lmp")
         game.new_episode(lmp_file_path)
@@ -686,17 +706,14 @@ def run_episode(agent, game, actions, episode, frame_skip, lmp_dir, record_video
 
     while not game.is_episode_finished():
         inference_start_time = time.time()
-
         action_index = agent.select_action(state)
-
         inference_end_time = time.time()
         inference_times.append(inference_end_time - inference_start_time)
 
         action = actions[action_index]
         action_counts[action_index] += 1
 
-        reward = game.make_action(action, frame_skip)
-        done = game.is_episode_finished()
+        reward, done = process_game_step(game, action, frame_skip)
 
         if not done:
             game_state = game.get_state()
@@ -709,6 +726,7 @@ def run_episode(agent, game, actions, episode, frame_skip, lmp_dir, record_video
                 if next_state is None:
                     logger.error(f"Error: next_state is None in episode {episode + 1} at step {step_count + 1}.")
                     break
+
                 damage_taken_step, damage_inflicted_step = get_game_state_info(game)
                 damage_taken += damage_taken_step
                 damage_inflicted += damage_inflicted_step
@@ -719,18 +737,7 @@ def run_episode(agent, game, actions, episode, frame_skip, lmp_dir, record_video
         else:
             next_state = np.zeros(state_shape)
 
-        agent.n_step_buffer.push(state, action_index, reward, next_state, done)
-
-        n_step_experience = agent.n_step_buffer.get()
-        if n_step_experience:
-            n_step_state, n_step_action, n_step_reward, n_step_next_state, n_step_done = n_step_experience
-            agent.memory.push(n_step_state, n_step_action, n_step_reward, n_step_next_state, n_step_done)
-
-        loss_step, avg_q_value_step, grad_norm_step = agent.learn()
-        if loss_step is not None:
-            loss = loss_step
-            avg_q_value = avg_q_value_step
-            grad_norm = grad_norm_step
+        loss, avg_q_value, grad_norm = update_agent(agent, state, action_index, reward, next_state, done, logger)
 
         state = next_state
         total_reward += reward
@@ -746,11 +753,7 @@ def run_episode(agent, game, actions, episode, frame_skip, lmp_dir, record_video
 
     episode_survival_time = time.time() - episode_start_time
     total_actions = sum(action_counts.values())
-    if total_actions > 0:
-        action_diversity = sum(count / total_actions for count in action_counts.values()) / len(actions)
-    else:
-        action_diversity = 0
-
+    action_diversity = sum(count / total_actions for count in action_counts.values()) / len(actions) if total_actions > 0 else 0
     avg_inference_time = np.mean(inference_times) if inference_times else 0
 
     if total_reward is not None:
@@ -812,13 +815,13 @@ def save_metrics(episode_rewards, episode_lengths, episode_survival_times,
         'gpu_memory_usage': gpu_memory_usage_list,
         'action_diversity': action_diversity_list
     })
-    
+
     # Merge with episode metrics if they exist
     if not episode_metrics_df.empty:
         metrics_df = pd.merge(base_metrics, episode_metrics_df, on='episode', how='left')
     else:
         metrics_df = base_metrics
-    
+
     # Add hyperparameters
     metrics_df['model_save_freq'] = MODEL_SAVE_FREQ
     metrics_df['batch_size'] = BATCH_SIZE
@@ -826,7 +829,7 @@ def save_metrics(episode_rewards, episode_lengths, episode_survival_times,
     metrics_df['learning_rate'] = LEARNING_RATE
     metrics_df['tau'] = TAU
     metrics_df['n_step'] = N_STEP
-    
+
     # Save to file
     now = datetime.now()
     dt_string = now.strftime("%Y%m%d%H%M")
@@ -857,7 +860,7 @@ def validate_input(value, param_type, min_val, max_val, default):
             val = float(value)
         else:
             val = int(value)
-        
+
         if min_val <= val <= max_val:
             return val
         print(f"Value out of range ({min_val}-{max_val}). Using default: {default}")
@@ -868,7 +871,7 @@ def validate_input(value, param_type, min_val, max_val, default):
 
 def get_hyperparameters():
     params = {
-        "learning_rate": {"default": 0.00025, "type": "float", "min": 0, "max": 1, 
+        "learning_rate": {"default": 0.00025, "type": "float", "min": 0, "max": 1,
                          "desc": "Step size for optimizer (0-1)"},
         "batch_size": {"default": 64, "type": "int", "min": 32, "max": 512,
                       "desc": "Batch size for training (32-512)"},
@@ -896,12 +899,12 @@ def get_hyperparameters():
 
     print("\nHyperparameter Configuration Menu")
     print("=================================")
-    
+
     for param_name, param_info in params.items():
         print(f"\n{param_name}: {param_info['desc']}")
         print(f"Default: {param_info['default']}")
         user_input = input(f"Enter value (or press Enter for default): ").strip()
-        
+
         if user_input:
             params[param_name]["value"] = validate_input(
                 user_input,
@@ -940,10 +943,10 @@ def quick_run_setup(logger):
             if model_choice in ['1', '2']:
                 break
             print("Please enter 1 or 2")
-            
+
         episodes = int(input("Enter number of episodes (default=1): ").strip() or "1")
         save_freq = int(input("Enter model save frequency (default=1): ").strip() or "1")
-        
+
         return {
             "num_episodes": max(1, episodes),
             "model_save_freq": max(1, save_freq),
@@ -963,14 +966,14 @@ def get_run_config(logger):
         "wad_path": None,
         "drive_model_dir": DRIVE_MODEL_DIR,
     }
-    
+
     # Get WAD setup
     wad_choice = get_wad_choice(logger)
     config["scenario_path"], config["wad_path"] = setup_scenario(wad_choice, logger)
-    
+
     # Get run mode
     run_mode = get_run_mode()
-    
+
     if run_mode == 1:  # Quick Run
         quick_config = quick_run_setup(logger)
         config.update(quick_config)
@@ -980,7 +983,7 @@ def get_run_config(logger):
             **params,
             "create_new_model": True  # Custom runs always create new model
         })
-    
+
     return config
 
 def main():
@@ -989,30 +992,30 @@ def main():
     log_dir = "logs"
     os.makedirs(log_dir, exist_ok=True)
     logger = setup_logger(log_dir, timestamp)
-    
+
     game = None
     video_writer = None
     tensorboard_writer = None
-    
+
     try:
         # Get configuration with logger
         config = get_run_config(logger)
-        
+
         if not config["scenario_path"]:
             logger.error("No scenario path specified")
             return
-            
+
         # Initialize game
         game, actions, state_shape = setup_vizdoom(
-            config["scenario_path"], 
-            config["wad_path"], 
+            config["scenario_path"],
+            config["wad_path"],
             logger
         )
-        
+
         if not all([game, actions, state_shape]):
             logger.error("Failed to initialize ViZDoom environment")
             return
-            
+
         # Initialize agent
         agent = DQNAgent(
             state_shape=state_shape,
@@ -1029,7 +1032,7 @@ def main():
             grad_clip_norm=config.get("grad_clip_norm", GRAD_CLIP_NORM),
             epsilon_decay_rate_step=config.get("epsilon_decay_rate_step", EPSILON_DECAY_RATE_STEP)
         )
-        
+
         # Load existing model if requested
         if not config.get("create_new_model", True):
             agent = scan_for_models(agent, config["drive_model_dir"], logger)
@@ -1069,10 +1072,10 @@ def main():
                     logger=logger,
                     episode_metrics_df=None  # Remove DataFrame dependency
                 )
-                
+
                 if metrics:
                     reward, steps, survival_time, damage_taken, damage_inflicted, action_diversity, inference_time, new_row = metrics
-                    
+
                     # Update metrics lists
                     episode_rewards.append(reward)
                     episode_lengths.append(steps)
@@ -1080,46 +1083,46 @@ def main():
                     episode_damage_taken.append(damage_taken)
                     episode_damage_inflicted.append(damage_inflicted)
                     action_diversity_list.append(action_diversity)
-                    
+
                     # Resource monitoring
                     ram_usage = psutil.Process().memory_info().rss / 1024 / 1024  # MB
                     ram_usage_list.append(ram_usage)
-                    
+
                     if torch.cuda.is_available():
                         gpu_memory = torch.cuda.memory_allocated() / 1024 / 1024  # MB
                         gpu_memory_usage_list.append(gpu_memory)
                     else:
                         gpu_memory_usage_list.append(0)
-                    
+
                     # Store metrics dictionary
                     if new_row:
                         metrics_data.append(new_row)
-                
+
                 # Save model if needed
                 if (episode + 1) % config["model_save_freq"] == 0:
                     model_path = os.path.join(config["drive_model_dir"], f"model_episode_{episode+1}.pth")
                     agent.save_model(model_path)
                     logger.info(f"Model saved at episode {episode+1}")
-                
+
                 # Save best model if enabled
                 if USE_BEST_MODEL_CALLBACK:
                     best_model_callback(agent, episode_rewards, logger, config["drive_model_dir"], BEST_MODEL_SMOOTHING_WINDOW)
-                
+
                 # Log progress
                 logger.info(f"Episode {episode+1}/{config['num_episodes']}: "
                           f"Reward={reward:.2f}, Steps={steps}, "
                           f"Epsilon={agent.epsilon:.3f}")
-                
+
                 # Cleanup after episode
                 cleanup_resources()
-                
+
             except Exception as e:
                 logger.error(f"Error in episode {episode}: {e}")
                 continue
-        
+
         # Create final metrics DataFrame
         episode_metrics_df = pd.DataFrame(metrics_data)
-        
+
         # Save final metrics
         training_time = time.time() - training_start_time
         save_metrics(
@@ -1128,11 +1131,11 @@ def main():
             episode_metrics_df, training_time, ram_usage_list,
             gpu_memory_usage_list, action_diversity_list
         )
-        
+
     except Exception as e:
         logger.error(f"Error during training: {e}")
         raise e
-        
+
     finally:
         # Cleanup
         try:
