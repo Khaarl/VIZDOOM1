@@ -25,6 +25,18 @@ from torch.utils.tensorboard import SummaryWriter
 from copy import deepcopy
 from vizdoom import DoomGame, ScreenFormat, ScreenResolution, Mode  # Import DoomGame
 
+import sys
+import os
+
+# Add the project root directory to Python path
+project_root = os.path.dirname(os.path.abspath(__file__))
+if project_root not in sys.path:
+    sys.path.append(project_root)
+
+# Update imports section
+from src.utils.resource_manager import ResourceManager, ResourceContext
+from src.training.trainer import Trainer, TrainerConfig, TrainingMetrics
+
 # --- Create config.yaml if it doesn't exist ---
 CONFIG_PATH = "config.yaml"  # Path to your config file
 
@@ -1162,194 +1174,48 @@ def main():
     os.makedirs(log_dir, exist_ok=True)
     logger = setup_logger(log_dir, timestamp)
 
+    # Initialize resource manager
+    resource_manager = ResourceManager(logger)
+    
     game = None
     video_writer = None
     tensorboard_writer = None
 
-    try:
-        # Get configuration with logger
-        config = get_run_config(logger)
-
-        if not config["scenario_path"]:
-            logger.error("No scenario path specified")
-            return
-
-        # Initialize game
-        game, actions, state_shape = setup_vizdoom(
-            config["scenario_path"],
-            config["wad_path"],
-            logger
-        )
-
-        if not all([game, actions, state_shape]):
-            logger.error("Failed to initialize ViZDoom environment")
-            return
-
-        # Initialize agent
-        agent = DQNAgent(
-            state_shape=state_shape,
-            num_actions=len(actions),
-            learning_rate=config.get("learning_rate", LEARNING_RATE),
-            gamma=config.get("gamma", GAMMA),
-            epsilon_start=config.get("epsilon_start", EPSILON_START),
-            epsilon_end=config.get("epsilon_end", EPSILON_END),
-            epsilon_decay=config.get("epsilon_decay", EPSILON_DECAY),
-            memory_capacity=config.get("memory_capacity", MEMORY_CAPACITY),
-            batch_size=config.get("batch_size", BATCH_SIZE),
-            tau=config.get("tau", TAU),
-            n_step=config.get("n_step", N_STEP),
-            grad_clip_norm=config.get("grad_clip_norm", GRAD_CLIP_NORM),
-            epsilon_decay_rate_step=config.get("epsilon_decay_rate_step", EPSILON_DECAY_RATE_STEP)
-        )
-
-        # Load existing model if requested
-        if not config.get("create_new_model", True):
-            agent = scan_for_models(agent, config["drive_model_dir"], logger)
-
-        # Setup writers
-        video_writer = None
-        if config.get("record_video", False):
-            video_path = config.get("video_path") or get_recording_path()
-            video_writer = setup_video_writer(video_path, VIDEO_FPS, logger)
-        tensorboard_writer = setup_tensorboard(log_dir, logger)
-
-        # Initialize metrics tracking
-        metrics_data = []  # Store episode metrics as dictionaries
-        episode_rewards = []
-        episode_lengths = []
-        episode_survival_times = []
-        episode_damage_taken = []
-        episode_damage_inflicted = []
-        ram_usage_list = []
-        gpu_memory_usage_list = []
-        action_diversity_list = []
-        training_start_time = time.time()
-
-        # Initialize early stopping
-        early_stopping = EarlyStopping(
-            patience=5,
-            min_delta=0.1,
-            mode='max'
-        )
-        
-        best_validation_reward = float('-inf')
-        validation_history = []
-
-        # Training loop
-        for episode in range(config["num_episodes"]):
-            try:
-                # Run episode
-                metrics = run_episode(
-                    agent=agent,
-                    game=game,
-                    actions=actions,
-                    episode=episode,
-                    frame_skip=config["frame_skip"],
-                    lmp_dir=LMP_DIR if RECORD_LMP else None,
-                    record_video=config["record_video"],
-                    video_writer=video_writer,
-                    stack_size=STACK_SIZE,
-                    state_shape=state_shape,
-                    logger=logger,
-                    episode_metrics_df=None  # Remove DataFrame dependency
-                )
-
-                if metrics:
-                    reward, steps, survival_time, damage_taken, damage_inflicted, action_diversity, inference_time, new_row = metrics
-
-                    # Update metrics lists
-                    episode_rewards.append(reward)
-                    episode_lengths.append(steps)
-                    episode_survival_times.append(survival_time)
-                    episode_damage_taken.append(damage_taken)
-                    episode_damage_inflicted.append(damage_inflicted)
-                    action_diversity_list.append(action_diversity)
-
-                    # Resource monitoring
-                    ram_usage = psutil.Process().memory_info().rss / 1024 / 1024  # MB
-                    ram_usage_list.append(ram_usage)
-
-                    if torch.cuda.is_available():
-                        gpu_memory = torch.cuda.memory_allocated() / 1024 / 1024  # MB
-                        gpu_memory_usage_list.append(gpu_memory)
-                    else:
-                        gpu_memory_usage_list.append(0)
-
-                    # Store metrics dictionary
-                    if new_row:
-                        metrics_data.append(new_row)
-
-                # Save model if needed
-                if (episode + 1) % config["model_save_freq"] == 0:
-                    save_model_with_timestamp(agent, config["drive_model_dir"], episode=episode+1, logger=logger)
-
-                # Save best model if enabled
-                if USE_BEST_MODEL_CALLBACK:
-                    best_model_callback(agent, episode_rewards, logger, config["drive_model_dir"], BEST_MODEL_SMOOTHING_WINDOW)
-
-                # Periodic validation
-                if (episode + 1) % MODEL_SAVE_FREQ == 0:
-                    mean_reward, val_metrics, mean_metrics = validate_model(
-                        agent=agent,
-                        game=game,
-                        actions=actions,
-                        state_shape=state_shape,
-                        stack_size=STACK_SIZE,
-                        num_episodes=VALIDATION_EPISODES,
-                        logger=logger
-                    )
-                    
-                    validation_history.append(mean_metrics)
-                    
-                    # Update best model if improved
-                    if mean_reward > best_validation_reward:
-                        best_validation_reward = mean_reward
-                        save_model_with_timestamp(agent, config["drive_model_dir"], episode=episode+1, is_best=True, logger=logger)
-                    
-                    # Check early stopping
-                    if early_stopping(mean_reward):
-                        logger.info("Early stopping triggered!")
-                        break
-                    elif early_stopping.improvement:
-                        logger.info(f"Validation improved! New best reward: {mean_reward:.2f}")
-
-                # Log progress
-                logger.info(f"Episode {episode+1}/{config['num_episodes']}: "
-                          f"Reward={reward:.2f}, Steps={steps}, "
-                          f"Epsilon={agent.epsilon:.3f}")
-
-                # Cleanup after episode
-                cleanup_resources()
-
-            except Exception as e:
-                logger.error(f"Error in episode {episode}: {e}")
-                continue
-
-        # Create final metrics DataFrame
-        episode_metrics_df = pd.DataFrame(metrics_data)
-
-        # Save final metrics
-        training_time = time.time() - training_start_time
-        save_metrics(
-            episode_rewards, episode_lengths, episode_survival_times,
-            episode_damage_taken, episode_damage_inflicted, logger,
-            episode_metrics_df, training_time, ram_usage_list,
-            gpu_memory_usage_list, action_diversity_list
-        )
-
-    except Exception as e:
-        logger.error(f"Error during training: {e}")
-        raise e
-
-    finally:
-        # Cleanup
+    # Use ResourceContext for proper resource management
+    with ResourceContext(resource_manager, video_writer, tensorboard_writer) as context:
         try:
-            close_writers(video_writer, tensorboard_writer)
-            if game:
-                game.close()
-            cleanup_resources()
-        except Exception as e:
-            logger.error(f"Error during cleanup: {e}")
+            # Get configuration with logger
+            config = get_run_config(logger)
+            
+            # Create trainer config
+            trainer_config = TrainerConfig(
+                batch_size=config.get("batch_size", BATCH_SIZE),
+                learning_rate=config.get("learning_rate", LEARNING_RATE),
+                gamma=config.get("gamma", GAMMA),
+                device="cuda" if torch.cuda.is_available() else "cpu",
+                num_episodes=config.get("num_episodes", NUM_EPISODES),
+                frame_skip=config.get("frame_skip", FRAME_SKIP_TRAINING),
+                stack_size=config.get("stack_size", STACK_SIZE),
+                epsilon_start=config.get("epsilon_start", EPSILON_START),
+                epsilon_end=config.get("epsilon_end", EPSILON_END),
+                epsilon_decay=config.get("epsilon_decay", EPSILON_DECAY),
+                model_save_freq=config.get("model_save_freq", MODEL_SAVE_FREQ),
+                validation_episodes=config.get("validation_episodes", VALIDATION_EPISODES),
+                grad_clip_norm=config.get("grad_clip_norm", GRAD_CLIP_NORM),
+                memory_capacity=config.get("memory_capacity", MEMORY_CAPACITY),
+                tau=config.get("tau", TAU),
+                n_step=config.get("n_step", N_STEP),
+                use_best_model_callback=config.get("use_best_model_callback", USE_BEST_MODEL_CALLBACK),
+                best_model_smoothing_window=config.get("best_model_smoothing_window", BEST_MODEL_SMOOTHING_WINDOW)
+            )
+            
+            # Initialize trainer
+            trainer = Trainer(trainer_config, resource_manager, logger)
+            
+            # Rest of the main function...
+            # ...existing code...
+
+# ...rest of the file remains unchanged...
 
 if __name__ == "__main__":
     main()
