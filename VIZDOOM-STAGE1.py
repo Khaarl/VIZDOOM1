@@ -778,14 +778,109 @@ def run_episode(agent, game, actions, episode, frame_skip, lmp_dir, record_video
         return None, 0, 0, 0, 0, 0, 0, None
 
 # --- Validation ---
+class EarlyStopping:
+    def __init__(self, patience=5, min_delta=0.0, mode='max'):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.mode = mode  # 'max' for reward maximization
+        self.counter = 0
+        self.best_score = None
+        self.early_stop = False
+        self.improvement = False
+    
+    def __call__(self, score):
+        if self.best_score is None:
+            self.best_score = score
+            self.improvement = True
+            return False
+            
+        if self.mode == 'max':
+            improved = score > self.best_score + self.min_delta
+        else:
+            improved = score < self.best_score - self.min_delta
+            
+        if improved:
+            self.best_score = score
+            self.counter = 0
+            self.improvement = True
+        else:
+            self.counter += 1
+            self.improvement = False
+            
+        if self.counter >= self.patience:
+            self.early_stop = True
+            
+        return self.early_stop
+
 def validate_model(agent, game, actions, state_shape, stack_size, num_episodes, logger):
-    """Validates the model by running a number of episodes and calculating the mean reward."""
-    total_rewards = []
-    for episode in range(num_episodes):
-        total_reward, _, _, _, _, _, _, _ = run_episode(agent, game, actions, episode, FRAME_SKIP_RECORDING, None, False, None, stack_size, state_shape, logger, pd.DataFrame())
-        if total_reward is not None:
-            total_rewards.append(total_reward)
-    return np.mean(total_rewards) if total_rewards else float('-inf')
+    """
+    Validate the agent's performance over multiple episodes with minimal exploration.
+    Returns mean reward and validation metrics dictionary.
+    """
+    # Store training state
+    training_state = {
+        'epsilon': agent.epsilon,
+        'train': agent.policy_net.training
+    }
+    
+    # Set validation state
+    agent.epsilon = 0.05  # Minimal exploration during validation
+    agent.policy_net.eval()  # Set network to evaluation mode
+    
+    validation_metrics = {
+        'rewards': [],
+        'steps': [],
+        'survival_times': [],
+        'damages_taken': [],
+        'damages_inflicted': []
+    }
+    
+    try:
+        for episode in range(num_episodes):
+            # Run validation episode
+            result = run_episode(
+                agent=agent,
+                game=game,
+                actions=actions,
+                episode=episode,
+                frame_skip=FRAME_SKIP_RECORDING,
+                lmp_dir=None,
+                record_video=False,
+                video_writer=None,
+                stack_size=stack_size,
+                state_shape=state_shape,
+                logger=logger,
+                episode_metrics_df=pd.DataFrame()
+            )
+            
+            if result[0] is not None:  # Check if episode was valid
+                reward, steps, survival_time, damage_taken, damage_inflicted, _, _, _ = result
+                validation_metrics['rewards'].append(reward)
+                validation_metrics['steps'].append(steps)
+                validation_metrics['survival_times'].append(survival_time)
+                validation_metrics['damages_taken'].append(damage_taken)
+                validation_metrics['damages_inflicted'].append(damage_inflicted)
+        
+        # Calculate summary statistics
+        mean_metrics = {
+            'mean_reward': np.mean(validation_metrics['rewards']),
+            'mean_steps': np.mean(validation_metrics['steps']),
+            'mean_survival': np.mean(validation_metrics['survival_times']),
+            'mean_damage_taken': np.mean(validation_metrics['damages_taken']),
+            'mean_damage_inflicted': np.mean(validation_metrics['damages_inflicted'])
+        }
+        
+        logger.info("Validation Results:")
+        for metric, value in mean_metrics.items():
+            logger.info(f"{metric}: {value:.2f}")
+            
+        return mean_metrics['mean_reward'], validation_metrics, mean_metrics
+        
+    finally:
+        # Restore training state
+        agent.epsilon = training_state['epsilon']
+        if training_state['train']:
+            agent.policy_net.train()
 
 def get_timestamp_prefix():
     """Get timestamp prefix in MMDDHHmm format"""
@@ -1130,6 +1225,16 @@ def main():
         action_diversity_list = []
         training_start_time = time.time()
 
+        # Initialize early stopping
+        early_stopping = EarlyStopping(
+            patience=5,
+            min_delta=0.1,
+            mode='max'
+        )
+        
+        best_validation_reward = float('-inf')
+        validation_history = []
+
         # Training loop
         for episode in range(config["num_episodes"]):
             try:
@@ -1181,6 +1286,32 @@ def main():
                 # Save best model if enabled
                 if USE_BEST_MODEL_CALLBACK:
                     best_model_callback(agent, episode_rewards, logger, config["drive_model_dir"], BEST_MODEL_SMOOTHING_WINDOW)
+
+                # Periodic validation
+                if (episode + 1) % MODEL_SAVE_FREQ == 0:
+                    mean_reward, val_metrics, mean_metrics = validate_model(
+                        agent=agent,
+                        game=game,
+                        actions=actions,
+                        state_shape=state_shape,
+                        stack_size=STACK_SIZE,
+                        num_episodes=VALIDATION_EPISODES,
+                        logger=logger
+                    )
+                    
+                    validation_history.append(mean_metrics)
+                    
+                    # Update best model if improved
+                    if mean_reward > best_validation_reward:
+                        best_validation_reward = mean_reward
+                        save_model_with_timestamp(agent, config["drive_model_dir"], episode=episode+1, is_best=True, logger=logger)
+                    
+                    # Check early stopping
+                    if early_stopping(mean_reward):
+                        logger.info("Early stopping triggered!")
+                        break
+                    elif early_stopping.improvement:
+                        logger.info(f"Validation improved! New best reward: {mean_reward:.2f}")
 
                 # Log progress
                 logger.info(f"Episode {episode+1}/{config['num_episodes']}: "
