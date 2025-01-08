@@ -4,25 +4,67 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 from google.colab import drive
-from utils.config import METRICS_DIR, LOGS_DIR, setup_logging
 import argparse
 import time
+import logging
+from datetime import datetime
 
-# Mount Google Drive (with force_remount=True option)
-drive.mount('/content/drive', force_remount=True)
+# Mount Google Drive
+try:
+    drive.mount('/content/drive')
+except:
+    print("Drive already mounted or not in Colab environment")
 
-# Configuration (Update with your actual path)
-DRIVE_MODEL_DIR = "/content/drive/My Drive/ViZDoomModels"
+# Configuration - Updated paths for Google Drive
+DRIVE_ROOT = "/content/drive/MyDrive/ViZDoom"  # Updated path
+METRICS_DIR = os.path.join(DRIVE_ROOT, "metrics")
+LOGS_DIR = os.path.join(DRIVE_ROOT, "logs")
+MODELS_DIR = os.path.join(DRIVE_ROOT, "models")
+
+# Ensure directories exist
+for directory in [DRIVE_ROOT, METRICS_DIR, LOGS_DIR, MODELS_DIR]:
+    os.makedirs(directory, exist_ok=True)
+
+def setup_colab_logging(name):
+    """Setup logging for Colab environment"""
+    logger = logging.getLogger(name)
+    logger.setLevel(logging.INFO)
+    
+    if logger.handlers:
+        logger.handlers.clear()
+    
+    # Console handler
+    handler = logging.StreamHandler()
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+    
+    return logger
+
+def get_latest_run():
+    """Get the most recent run ID from metrics directory"""
+    metrics_files = glob.glob(os.path.join(METRICS_DIR, "*.csv"))
+    if not metrics_files:
+        return None
+    latest_file = max(metrics_files, key=os.path.getctime)
+    return os.path.basename(latest_file).split('_')[0]
 
 def load_and_combine_metrics(model_dir):
     """
     Loads and combines all CSV files from the specified directory.
     Handles duplicate column names effectively by keeping only the first occurrence.
     """
+    print(f"Looking for CSV files in: {model_dir}")  # Debug print
     metrics_files = glob.glob(os.path.join(model_dir, "*.csv"))
-
+    
     if not metrics_files:
-        print("No CSV files found.")
+        # Try alternative path format
+        alt_path = model_dir.replace("/content/drive/MyDrive", "/content/drive/My Drive")
+        print(f"Trying alternative path: {alt_path}")  # Debug print
+        metrics_files = glob.glob(os.path.join(alt_path, "*.csv"))
+    
+    if not metrics_files:
+        print(f"No CSV files found in either {model_dir} or alternative path")
         return None
 
     all_metrics = []
@@ -173,19 +215,17 @@ def visualize_metrics(metrics_df, output_dir=None, clear_previous=False):
 # Add real-time monitoring capabilities
 def monitor_training(run_id=None):
     """Monitor training progress in real-time"""
-    logger, _ = setup_logging("dashboard", run_id)
+    logger = setup_colab_logging("dashboard")
     
     if run_id is None:
-        # Get latest run if no run_id specified
-        metrics_files = glob.glob(os.path.join(METRICS_DIR, "*_metrics.csv"))
-        if not metrics_files:
+        run_id = get_latest_run()
+        if run_id is None:
             logger.error("No metrics files found")
             return
-        latest_file = max(metrics_files, key=os.path.getctime)
-        run_id = os.path.basename(latest_file).split('_')[0]
     
     metrics_file = os.path.join(METRICS_DIR, f"{run_id}_metrics.csv")
     
+    logger.info(f"Monitoring metrics file: {metrics_file}")
     while True:
         try:
             if os.path.exists(metrics_file):
@@ -202,22 +242,61 @@ def monitor_training(run_id=None):
             logger.error(f"Error monitoring metrics: {e}")
             time.sleep(10)
 
-# Update main function
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--run_id', type=str, help='Specific run ID to monitor')
-    parser.add_argument('--mode', choices=['monitor', 'analyze'], default='analyze',
-                       help='Monitor training in real-time or analyze completed runs')
-    args = parser.parse_args()
-
-    if args.mode == 'monitor':
-        monitor_training(args.run_id)
+# Remove argparse for Colab compatibility
+def run_dashboard(mode='analyze', run_id=None):
+    """Main dashboard function that can be called from Colab"""
+    print(f"Dashboard running in {mode} mode")  # Debug print
+    print(f"Looking for metrics in: {METRICS_DIR}")  # Debug print
+    
+    if mode == 'monitor':
+        monitor_training(run_id)
     else:
-        # Existing analysis code
         metrics_df = load_and_combine_metrics(METRICS_DIR)
         if metrics_df is not None:
             output_directory = os.path.join(METRICS_DIR, "plots")
             visualize_metrics(metrics_df, output_directory)
+        else:
+            print("No metrics data found to visualize")
 
+# Replace main() with Colab-friendly version
 if __name__ == "__main__":
-    main()
+    # Check if running in Colab
+    try:
+        import google.colab
+        in_colab = True
+    except ImportError:
+        in_colab = False
+
+    if in_colab:
+        # Default to analysis mode in Colab
+        run_dashboard(mode='analyze')
+    else:
+        # For command line usage (non-Colab)
+        try:
+            import argparse
+            parser = argparse.ArgumentParser(description='ViZDoom Training Dashboard')
+            parser.add_argument('--run_id', type=str, help='Specific run ID to monitor')
+            parser.add_argument('--mode', choices=['monitor', 'analyze'], 
+                              default='analyze',
+                              help='Monitor training in real-time or analyze completed runs')
+            # Only parse known args to avoid conflicts with Jupyter/Colab
+            args, unknown = parser.parse_known_args()
+            run_dashboard(args.mode, args.run_id)
+        except Exception as e:
+            print(f"Command line parsing failed: {e}")
+            # Fall back to default analysis mode
+            run_dashboard(mode='analyze')
+
+# Add Colab usage examples as comments
+"""
+# Usage in Colab:
+
+# For analysis mode:
+run_dashboard(mode='analyze')
+
+# For monitoring mode:
+run_dashboard(mode='monitor')
+
+# For monitoring specific run:
+run_dashboard(mode='monitor', run_id='YourRunID')
+"""
