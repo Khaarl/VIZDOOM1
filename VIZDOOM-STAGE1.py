@@ -25,8 +25,6 @@ from torch.utils.tensorboard import SummaryWriter
 from copy import deepcopy
 from vizdoom import DoomGame, ScreenFormat, ScreenResolution, Mode  # Import DoomGame
 
-from utils.config import setup_logging, METRICS_DIR, MODELS_DIR, get_run_id
-
 # --- Create config.yaml if it doesn't exist ---
 CONFIG_PATH = "config.yaml"  # Path to your config file
 
@@ -801,7 +799,7 @@ def save_model_with_timestamp(agent, model_dir, episode=None, is_best=False, log
             filename = f"{timestamp}_best_model.pth"
         else:
             filename = f"{timestamp}_model_episode_{episode}.pth"
-        
+
         model_path = os.path.join(model_dir, filename)
         agent.save_model(model_path)
         if logger:
@@ -818,7 +816,7 @@ def best_model_callback(agent, episode_rewards, logger, model_dir, best_model_sm
         avg_reward = np.mean(episode_rewards[-best_model_smoothing_window:])
     else:
         avg_reward = np.mean(episode_rewards) if episode_rewards else float('-inf')
-    
+
     if avg_reward > agent.best_avg_reward:
         agent.best_avg_reward = avg_reward
         agent.best_model_state = deepcopy(agent.policy_net.state_dict())
@@ -1001,7 +999,7 @@ def quick_run_setup(logger):
                 print("Please enter a positive number")
             except ValueError:
                 print("Please enter a valid number")
-        
+
         # Get save frequency with input validation
         while True:
             try:
@@ -1025,12 +1023,12 @@ def quick_run_setup(logger):
             "frame_skip": FRAME_SKIP_RECORDING if should_record else FRAME_SKIP_TRAINING,
             "create_new_model": model_choice == '1'
         })
-        
+
         logger.info(f"Quick run setup complete. Episodes: {episodes}, Save frequency: {save_freq}, Recording: {should_record}")
         if should_record:
             logger.info(f"Video will be saved to: {video_path}")
         return config
-        
+
     except Exception as e:
         logger.error(f"Error in quick run setup: {e}")
         return default_config
@@ -1062,26 +1060,7 @@ def get_run_config(logger):
 
     return config
 
-def initialize_training_session():
-    run_id = get_run_id()
-    logger, _ = setup_logging("vizdoom_training", run_id)
-    return logger, run_id
-
-def log_training_metrics(metrics, run_id, episode):
-    """Log metrics to CSV file"""
-    metrics_file = os.path.join(METRICS_DIR, f"{run_id}_metrics.csv")
-    
-    # Convert metrics to DataFrame row
-    metrics_row = pd.DataFrame([metrics])
-    
-    # Append or create file
-    if os.path.exists(metrics_file):
-        metrics_row.to_csv(metrics_file, mode='a', header=False, index=False)
-    else:
-        metrics_row.to_csv(metrics_file, index=False)
-
 def main():
-    logger, run_id = initialize_training_session()
     # Initialize logger first
     timestamp = datetime.now().strftime("%Y%m%d%H%M")
     log_dir = "logs"
