@@ -25,6 +25,8 @@ from torch.utils.tensorboard import SummaryWriter
 from copy import deepcopy
 from vizdoom import DoomGame, ScreenFormat, ScreenResolution, Mode  # Import DoomGame
 
+from utils.config import setup_logging, METRICS_DIR, MODELS_DIR, get_run_id
+
 # --- Create config.yaml if it doesn't exist ---
 CONFIG_PATH = "config.yaml"  # Path to your config file
 
@@ -1060,7 +1062,26 @@ def get_run_config(logger):
 
     return config
 
+def initialize_training_session():
+    run_id = get_run_id()
+    logger, _ = setup_logging("vizdoom_training", run_id)
+    return logger, run_id
+
+def log_training_metrics(metrics, run_id, episode):
+    """Log metrics to CSV file"""
+    metrics_file = os.path.join(METRICS_DIR, f"{run_id}_metrics.csv")
+    
+    # Convert metrics to DataFrame row
+    metrics_row = pd.DataFrame([metrics])
+    
+    # Append or create file
+    if os.path.exists(metrics_file):
+        metrics_row.to_csv(metrics_file, mode='a', header=False, index=False)
+    else:
+        metrics_row.to_csv(metrics_file, index=False)
+
 def main():
+    logger, run_id = initialize_training_session()
     # Initialize logger first
     timestamp = datetime.now().strftime("%Y%m%d%H%M")
     log_dir = "logs"

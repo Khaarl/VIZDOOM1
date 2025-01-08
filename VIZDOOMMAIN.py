@@ -603,12 +603,30 @@ def setup_vizdoom(scenario_path, wad_path=None, logger=None):
         return None, None, None
 
 # --- Video Writer ---
-def setup_video_writer(video_path, video_fps, logger=None):
-    """Setup video writer with explicit path"""
+# Add video format options
+VIDEO_FORMATS = {
+    "mp4": {"extension": ".mp4", "codec": "libx264"},
+    "avi": {"extension": ".avi", "codec": "rawvideo"},
+    "gif": {"extension": ".gif", "codec": None}
+}
+
+def get_recording_path(format="mp4"):
+    """Get recording path with timestamp prefix and format"""
+    timestamp = datetime.now().strftime("%m%d%H%M")
+    format_info = VIDEO_FORMATS.get(format, VIDEO_FORMATS["mp4"])
+    filename = f"{timestamp}_game_recording{format_info['extension']}"
+    os.makedirs(VIDEO_DIR, exist_ok=True)
+    return os.path.join(VIDEO_DIR, filename), format_info["codec"]
+
+def setup_video_writer(video_path, video_fps, codec=None, logger=None):
+    """Enhanced video writer setup with codec support"""
     if video_path:
         try:
             os.makedirs(os.path.dirname(video_path), exist_ok=True)
-            video_writer = imageio.get_writer(video_path, fps=video_fps)
+            writer_kwargs = {"fps": video_fps}
+            if codec:
+                writer_kwargs["codec"] = codec
+            video_writer = imageio.get_writer(video_path, **writer_kwargs)
             if logger:
                 logger.info(f"Video Writer set up at: {video_path}")
             return video_writer
